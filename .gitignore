@@ -1,2 +1,13 @@
 __pycache__/
 *.pyc
+
+# 환경 변수 (API 키 등 민감 정보)
+.env
+
+# 학습된 모델 바이너리 (디렉토리 구조는 유지)
+models/*.pkl
+models/*.joblib
+
+# 학습 데이터 (디렉토리 구조는 유지)
+data/*.csv
+data/*.json
