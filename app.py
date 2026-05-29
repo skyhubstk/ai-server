@@ -1,66 +1,127 @@
 """
-app.py — 백엔드 통합 사용 예제
+app.py  ─ ChatDart AI 동작 확인용 데모 스크립트
 
-실제 백엔드에서는 아래처럼 chatdart_ai 모듈을 직접 import하여 사용합니다.
+[사용 흐름]
+  1. python train.py     → 모델 학습 (model_nonfin.pkl / model_fin.pkl 생성)
+  2. python app.py       → 예측 동작 확인
 
-    from chatdart_ai import predict_next_profit, train_from_records
-
-이 파일은 동작 확인용 샘플 스크립트입니다.
-실행: python app.py
+[버그 수정]
+  - chatdart_ai 모듈 없음 → predictor.predict_from_raw() 직접 사용
+  - NON_FIN_RAW: "debt_*" → "tl_*" (total_liabilities, feature_engineering과 일치)
+  - FIN_RAW: window=2 기준 (ta_0~1, tl_0~1, equity_0~1, net_0~1)
+  - 비금융 예측값 = 영업이익률(float) → 역산하여 영업이익(원) 출력
 """
 
-from chatdart_ai import predict_next_profit, train_from_records, ModelNotFoundError
+import logging
 
-# ── 샘플 재무제표 데이터 (단위: 백만원) ──────────────────────────────
-SAMPLE_RECORDS = [
-    {"company": "샘플기업", "year": 2018, "revenue": 1_000_000, "operating_profit":  80_000, "net_income":  60_000, "debt": 300_000, "equity": 500_000, "cash":  50_000},
-    {"company": "샘플기업", "year": 2019, "revenue": 1_100_000, "operating_profit":  90_000, "net_income":  68_000, "debt": 290_000, "equity": 550_000, "cash":  55_000},
-    {"company": "샘플기업", "year": 2020, "revenue": 1_050_000, "operating_profit":  75_000, "net_income":  55_000, "debt": 310_000, "equity": 540_000, "cash":  48_000},
-    {"company": "샘플기업", "year": 2021, "revenue": 1_200_000, "operating_profit": 110_000, "net_income":  82_000, "debt": 280_000, "equity": 600_000, "cash":  70_000},
-    {"company": "샘플기업", "year": 2022, "revenue": 1_350_000, "operating_profit": 130_000, "net_income":  98_000, "debt": 270_000, "equity": 670_000, "cash":  85_000},
-    {"company": "샘플기업", "year": 2023, "revenue": 1_500_000, "operating_profit": 155_000, "net_income": 115_000, "debt": 260_000, "equity": 750_000, "cash": 100_000},
-]
+from predictor import predict_from_raw, ModelNotFoundError
 
-# 분석 요청용 입력 (가장 최근 5개 연도 = 2019~2023)
-SAMPLE_INPUT = {
-    "revenue_0": 1_100_000, "revenue_1": 1_050_000, "revenue_2": 1_200_000,
-    "revenue_3": 1_350_000, "revenue_4": 1_500_000,
-    "op_0":  90_000, "op_1":  75_000, "op_2": 110_000,
-    "op_3": 130_000, "op_4": 155_000,
-    "net_0":  68_000, "net_1":  55_000, "net_2":  82_000,
-    "net_3":  98_000, "net_4": 115_000,
-    "debt_0": 290_000, "debt_1": 310_000, "debt_2": 280_000,
-    "debt_3": 270_000, "debt_4": 260_000,
-    "equity_0": 550_000, "equity_1": 540_000, "equity_2": 600_000,
-    "equity_3": 670_000, "equity_4": 750_000,
-    "cash_0": 55_000, "cash_1": 48_000, "cash_2": 70_000,
-    "cash_3": 85_000, "cash_4": 100_000,
+logging.basicConfig(level=logging.WARNING)  # 데모 시 INFO 로그 숨김
+
+# ─────────────────────────────────────────────────────────────
+# 비금융 샘플 데이터 (윈도우 5년: 2020~2024)
+# 키: revenue_0~4, op_0~4, net_0~4, tl_0~4, equity_0~4, cash_0~4, ta_0~4
+#     (0=가장 오래된 연도, 4=가장 최근 연도)
+# ─────────────────────────────────────────────────────────────
+NON_FIN_RAW = {
+    # 매출액 (원)
+    "revenue_0": 1_050_000_000_000,
+    "revenue_1": 1_200_000_000_000,
+    "revenue_2": 1_350_000_000_000,
+    "revenue_3": 1_500_000_000_000,
+    "revenue_4": 1_650_000_000_000,
+    # 영업이익 (원)
+    "op_0":  75_000_000_000,
+    "op_1": 110_000_000_000,
+    "op_2": 130_000_000_000,
+    "op_3": 155_000_000_000,
+    "op_4": 178_000_000_000,
+    # 당기순이익 (원)
+    "net_0":  55_000_000_000,
+    "net_1":  82_000_000_000,
+    "net_2":  98_000_000_000,
+    "net_3": 115_000_000_000,
+    "net_4": 133_000_000_000,
+    # 부채총계 total_liabilities (※ "debt_*" → "tl_*" 수정)
+    "tl_0": 310_000_000_000,
+    "tl_1": 280_000_000_000,
+    "tl_2": 270_000_000_000,
+    "tl_3": 260_000_000_000,
+    "tl_4": 250_000_000_000,
+    # 자본총계 (원)
+    "equity_0": 540_000_000_000,
+    "equity_1": 600_000_000_000,
+    "equity_2": 670_000_000_000,
+    "equity_3": 750_000_000_000,
+    "equity_4": 850_000_000_000,
+    # 현금및현금성자산 (원)
+    "cash_0":  48_000_000_000,
+    "cash_1":  70_000_000_000,
+    "cash_2":  85_000_000_000,
+    "cash_3": 100_000_000_000,
+    "cash_4": 120_000_000_000,
+    # 총자산 (tl + equity 로 대체 가능, 없으면 0)
+    "ta_0": 850_000_000_000,
+    "ta_1": 880_000_000_000,
+    "ta_2": 940_000_000_000,
+    "ta_3": 1_010_000_000_000,
+    "ta_4": 1_100_000_000_000,
+}
+
+# ─────────────────────────────────────────────────────────────
+# 금융 샘플 데이터 (윈도우 2년: 2023~2024) ← window=2 기준
+# 키: ta_0~1, tl_0~1, equity_0~1, net_0~1
+#     (0=과거 1년, 1=최근 1년)
+# ─────────────────────────────────────────────────────────────
+FIN_RAW = {
+    # 총자산 (원)
+    "ta_0": 255_000_000_000_000,   # 2023
+    "ta_1": 270_000_000_000_000,   # 2024
+    # 부채총계 (원)
+    "tl_0": 232_000_000_000_000,
+    "tl_1": 245_000_000_000_000,
+    # 자본총계 (원)
+    "equity_0": 23_000_000_000_000,
+    "equity_1": 25_000_000_000_000,
+    # 당기순이익 (원)
+    "net_0": 2_000_000_000_000,
+    "net_1": 2_200_000_000_000,
 }
 
 
 def main():
-    print("=" * 60)
-    print("ChatDart AI — 사용 예제")
-    print("=" * 60)
+    sep = "=" * 65
+    print(sep)
+    print("ChatDart AI  --  비금융 / 금융 분리 예측 데모")
+    print(sep)
 
-    # ── 1단계: 모델 학습 ──
-    print("\n[1] 모델 학습 중...")
-    result = train_from_records(SAMPLE_RECORDS, save_csv=True)
-    print(f"    MAE     : {result['mae']:,.0f}")
-    print(f"    MAPE    : {result['mape']:.2f}%")
-    print(f"    샘플 수  : {result['n_samples']}")
-    print(f"    트리 수  : {result['best_iter']}")
-
-    # ── 2단계: 예측 ──
-    print("\n[2] 다음 연도 영업이익 예측 중...")
+    # ── 비금융 예측 ──────────────────────────────────────────
+    print("\n[비금융] 다음 연도 영업이익 예측...")
     try:
-        pred = predict_next_profit(SAMPLE_INPUT)
-        print(f"\n    예측 영업이익 : {pred:,.0f} 백만원")
-        print("\n    ※ GPT 요약은 백엔드에서 이 예측값을 활용하여 생성합니다.")
+        result = predict_from_raw(NON_FIN_RAW, sector="non_financial")
+        margin = result["predicted_op_margin"]
+        profit = result["predicted_op_profit"]
+        rev    = result["base_revenue"]
+        print(f"  기준 매출액       : {rev:>20,.0f} 원")
+        print(f"  예측 영업이익률   : {margin:>20.4f}  ({margin*100:.2f}%)")
+        print(f"  예측 영업이익(역산): {profit:>20,.0f} 원")
     except ModelNotFoundError as e:
-        print(f"    [오류] {e}")
+        print(f"  [오류] {e}")
+        print("  → python train.py 를 먼저 실행하세요.")
 
-    print("\n" + "=" * 60)
+    # ── 금융 예측 ────────────────────────────────────────────
+    print("\n[금융]   다음 연도 당기순이익 예측...")
+    try:
+        result = predict_from_raw(FIN_RAW, sector="financial")
+        ni     = result["predicted_net_income"]
+        print(f"  예측 당기순이익   : {ni:>20,.0f} 원")
+    except ModelNotFoundError as e:
+        print(f"  [오류] {e}")
+        print("  → python train.py 를 먼저 실행하세요.")
+
+    print()
+    print("  ※ 실제 서비스: 백엔드에서 predict_from_raw() 결과를 GPT에 전달하여 해설 생성")
+    print(sep)
 
 
 if __name__ == "__main__":

@@ -1,33 +1,35 @@
 """
 train.py
 
-학습 파이프라인:
-  1. data/train.csv 로드
-  2. dataset_builder.make_window() → 슬라이딩 윈도우 샘플 생성
-  3. feature_engineering.create_features_df() → 파생 피처 생성
-  4. TimeSeriesSplit 교차검증으로 과거→미래 순서 유지
-  5. LightGBM 학습 (Early Stopping + 정규화 하이퍼파라미터)
-  6. models/model.pkl 저장
+[ChatGPT5.pdf 반영]
+  1. 비금융 타깃: next_operating_profit → next_op_margin (영업이익률)
+     · 삼성전자(50조)~소형주(100억) scale 차이 → 비율로 정규화 → MAPE 안정화
+  2. 금융 모델: LightGBM → Ridge Regression (샘플 부족 시 단순 모델이 안전)
+     · 샘플 < MIN_FIN_SAMPLES(50): 경고 출력 후 Ridge 사용
+  3. 평가지표: MAPE 단독 → MAE + SMAPE 병행
 
-실행:
-  python train.py
+비금융: models/model_nonfin.pkl
+금융  : models/model_fin.pkl
 """
 
 import os
 import logging
 import warnings
-import pandas as pd
 import numpy as np
+import pandas as pd
 from joblib import dump
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from sklearn.metrics import mean_absolute_error
+from sklearn.linear_model import Ridge
 from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 
 from dataset_builder import make_window
-from feature_engineering import create_features_df, FEATURE_COLUMNS
+from feature_engineering import (
+    create_features_df,     FEATURE_COLUMNS,
+    create_features_fin_df, FEATURE_COLUMNS_FIN,
+)
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -36,121 +38,184 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── 경로 설정 ──────────────────────────────────
-DATA_PATH  = "data/train.csv"
-MODEL_DIR  = "models"
-MODEL_PATH = os.path.join(MODEL_DIR, "model.pkl")
+DATA_PATH    = "data/train.csv"
+MODEL_DIR    = "models"
+MODEL_NONFIN = os.path.join(MODEL_DIR, "model_nonfin.pkl")
+MODEL_FIN    = os.path.join(MODEL_DIR, "model_fin.pkl")
 
-# ── 하이퍼파라미터 ──────────────────────────────
-# • n_estimators 충분히 크게 → early stopping 으로 실제 최적 트리 수 결정
-# • learning_rate 낮게 (0.01) → 과적합 방지, 일반화 성능 향상
-# • num_leaves 작게 (15) → max_depth=4 기준 2^4-1, 재무 데이터 샘플 부족에 대응
-# • subsample/colsample_bytree: 배깅 + 피처 샘플링으로 분산 감소
-# • reg_alpha(L1) + reg_lambda(L2): 가중치 정규화
+# 금융 샘플 최소 기준 (미만이면 Ridge 사용, 경고 로그)
+MIN_FIN_SAMPLES = 50
+
+# ── 비금융 하이퍼파라미터 (LightGBM) ──
 LGBM_PARAMS = dict(
-    n_estimators       = 2000,
-    learning_rate      = 0.01,
-    max_depth          = 4,
-    num_leaves         = 15,
-    min_child_samples  = 5,       # 리프 최소 샘플 수 (소규모 데이터 대응)
-    subsample          = 0.8,     # 행 배깅 비율
-    subsample_freq     = 1,
-    colsample_bytree   = 0.8,     # 컬럼 샘플링 비율
-    reg_alpha          = 0.1,     # L1 정규화
-    reg_lambda         = 1.0,     # L2 정규화
-    random_state       = 42,
-    n_jobs             = -1,
-    verbose            = -1,
+    n_estimators      = 2000,
+    learning_rate     = 0.01,
+    max_depth         = 4,
+    num_leaves        = 15,
+    min_child_samples = 5,
+    subsample         = 0.8,
+    subsample_freq    = 1,
+    colsample_bytree  = 0.8,
+    reg_alpha         = 0.1,
+    reg_lambda        = 1.0,
+    random_state      = 42,
+    n_jobs            = -1,
+    verbose           = -1,
 )
-EARLY_STOPPING_ROUNDS = 50
-N_CV_SPLITS           = 5       # TimeSeriesSplit 분할 수
+EARLY_STOPPING_ROUNDS = 30
+N_CV_NONFIN           = 5
+N_CV_FIN              = 2
 
 
-def run_training(raw_df: pd.DataFrame = None) -> dict:
+# ── 평가지표 ──────────────────────────────────
+
+def _smape(actual: np.ndarray, pred: np.ndarray) -> float:
     """
-    학습 파이프라인 실행.
-
-    Parameters
-    ----------
-    raw_df : 이미 로드된 DataFrame (None 이면 DATA_PATH 에서 읽음)
-
-    Returns
-    -------
-    dict : {"mae": float, "mape": float, "n_samples": int, "model_path": str}
+    Symmetric MAPE — 실제값 0 근처에서도 폭주 없음.
+    SMAPE = mean(|actual-pred| / ((|actual|+|pred|)/2)) * 100
+    분모가 0이면 해당 항목은 0으로 처리.
     """
-    # ── 1. 데이터 로드 ──
-    if raw_df is None:
-        log.info("학습 데이터 로드: %s", DATA_PATH)
-        raw_df = pd.read_csv(DATA_PATH)
-    log.info("원시 데이터 shape: %s", raw_df.shape)
+    denom = (np.abs(actual) + np.abs(pred)) / 2.0
+    ratio = np.where(denom < 1e-9, 0.0, np.abs(actual - pred) / denom)
+    return float(np.mean(ratio) * 100)
 
-    # ── 2. 슬라이딩 윈도우 샘플 생성 ──
-    log.info("슬라이딩 윈도우 샘플 생성 중...")
-    window_df = make_window(raw_df)
-    log.info("윈도우 샘플 수: %d", len(window_df))
 
-    # ── 3. 파생 피처 생성 ──
-    log.info("피처 엔지니어링 중...")
-    X = create_features_df(window_df)
-    y = window_df["next_operating_profit"].values
-    log.info("피처 수: %d", X.shape[1])
+# ── 비금융 CV ──────────────────────────────────
 
-    # ── 4. TimeSeriesSplit 교차검증 ──
-    # random split 대신 시간 순서를 보존하는 분할 사용
-    tscv = TimeSeriesSplit(n_splits=N_CV_SPLITS)
-    cv_mae, cv_mape = [], []
+def _run_cv_nonfin(X: pd.DataFrame, y: np.ndarray) -> tuple:
+    tscv = TimeSeriesSplit(n_splits=N_CV_NONFIN)
+    cv_mae, cv_smape, best_iters = [], [], []
 
-    log.info("TimeSeriesSplit %d-Fold CV 시작...", N_CV_SPLITS)
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
-        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_tr, y_val = y[train_idx], y[val_idx]
-
-        model_cv = LGBMRegressor(**LGBM_PARAMS)
-        model_cv.fit(
-            X_tr, y_tr,
-            eval_set=[(X_val, y_val)],
+    log.info("[비금융] TimeSeriesSplit %d-Fold CV (타깃: 영업이익률)", N_CV_NONFIN)
+    for fold, (tr_i, val_i) in enumerate(tscv.split(X), 1):
+        m = LGBMRegressor(**LGBM_PARAMS)
+        m.fit(
+            X.iloc[tr_i], y[tr_i],
+            eval_set=[(X.iloc[val_i], y[val_i])],
             callbacks=[
                 early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
                 log_evaluation(period=-1),
             ],
         )
+        best_iters.append(getattr(m, "best_iteration_", LGBM_PARAMS["n_estimators"]))
 
-        preds = model_cv.predict(X_val)
-        fold_mae  = mean_absolute_error(y_val, preds)
-        fold_mape = mean_absolute_percentage_error(y_val, preds)
-        cv_mae.append(fold_mae)
-        cv_mape.append(fold_mape)
-        log.info("  Fold %d | MAE=%.2f | MAPE=%.2f%%",
-                 fold, fold_mae, fold_mape * 100)
+        preds = m.predict(X.iloc[val_i])
+        mae   = mean_absolute_error(y[val_i], preds)
+        smp   = _smape(y[val_i], preds)
+        cv_mae.append(mae); cv_smape.append(smp)
+        log.info("  Fold %d | MAE=%.4f | SMAPE=%.2f%%", fold, mae, smp)
 
-    log.info("CV 평균 MAE=%.2f  MAPE=%.2f%%",
-             np.mean(cv_mae), np.mean(cv_mape) * 100)
+    log.info("[비금융] CV 평균 MAE=%.4f  SMAPE=%.2f%%",
+             np.mean(cv_mae), np.mean(cv_smape))
+    return cv_mae, cv_smape, best_iters
 
-    # ── 5. 전체 데이터로 최종 모델 학습 ──
-    log.info("전체 데이터로 최종 모델 학습 중...")
-    # CV 평균 best iteration 추정
-    best_iter = int(np.mean([
-        getattr(m, "best_iteration_", LGBM_PARAMS["n_estimators"])
-        for m in [model_cv]          # 마지막 fold 모델 기준
-    ]))
-    best_iter = max(best_iter, 100)
 
-    final_params = {**LGBM_PARAMS, "n_estimators": best_iter}
-    final_model  = LGBMRegressor(**final_params)
-    final_model.fit(X, y)
+# ── 금융 CV (Ridge) ──────────────────────────────────
 
-    # ── 6. 모델 저장 ──
+def _run_cv_fin(X: pd.DataFrame, y: np.ndarray) -> tuple:
+    n = len(X)
+    if n < MIN_FIN_SAMPLES:
+        log.warning("[금융] 샘플 %d개 < %d → Ridge Regression 사용 (과적합 방지)",
+                    n, MIN_FIN_SAMPLES)
+    else:
+        log.info("[금융] 샘플 %d개 → Ridge Regression", n)
+
+    tscv = TimeSeriesSplit(n_splits=N_CV_FIN)
+    cv_mae, cv_smape = [], []
+
+    log.info("[금융] TimeSeriesSplit %d-Fold CV (타깃: 순이익)", N_CV_FIN)
+    for fold, (tr_i, val_i) in enumerate(tscv.split(X), 1):
+        m = Ridge(alpha=10.0)
+        m.fit(X.iloc[tr_i], y[tr_i])
+        preds = m.predict(X.iloc[val_i])
+        mae   = mean_absolute_error(y[val_i], preds)
+        smp   = _smape(y[val_i], preds)
+        cv_mae.append(mae); cv_smape.append(smp)
+        log.info("  Fold %d | MAE=%.4g | SMAPE=%.2f%%", fold, mae, smp)
+
+    log.info("[금융] CV 평균 MAE=%.4g  SMAPE=%.2f%%",
+             np.mean(cv_mae), np.mean(cv_smape))
+    return cv_mae, cv_smape
+
+
+# ── 메인 ──────────────────────────────────────
+
+def run_training(raw_df: pd.DataFrame = None) -> dict:
+    """
+    비금융/금융 분기 학습 파이프라인.
+
+    Returns
+    -------
+    dict : {"nonfin": {...}, "fin": {...}}
+    """
+    if raw_df is None:
+        log.info("학습 데이터 로드: %s", DATA_PATH)
+        raw_df = pd.read_csv(DATA_PATH)
+    log.info("원시 데이터 shape: %s", raw_df.shape)
+
+    log.info("슬라이딩 윈도우 샘플 생성 중...")
+    nonfin_window, fin_window = make_window(raw_df)
+    log.info("비금융 샘플: %d행  /  금융 샘플: %d행",
+             len(nonfin_window), len(fin_window))
+
     os.makedirs(MODEL_DIR, exist_ok=True)
-    dump(final_model, MODEL_PATH)
-    log.info("모델 저장 완료: %s  (trees=%d)", MODEL_PATH, best_iter)
+    result = {}
 
-    result = {
-        "mae":         round(float(np.mean(cv_mae)), 2),
-        "mape":        round(float(np.mean(cv_mape)) * 100, 2),
-        "n_samples":   int(len(X)),
-        "model_path":  MODEL_PATH,
-        "best_iter":   best_iter,
-    }
-    log.info("학습 결과: %s", result)
+    # ── A. 비금융 ──────────────────────────────
+    if not nonfin_window.empty:
+        log.info("=" * 55)
+        log.info("비금융 모델 학습 (LightGBM / 타깃=영업이익률)")
+        X_nf = create_features_df(nonfin_window)
+        y_nf = nonfin_window["next_op_margin"].values
+
+        cv_mae, cv_smape, best_iters = _run_cv_nonfin(X_nf, y_nf)
+
+        best_iter    = max(int(np.mean(best_iters)), 50)
+        final_params = {**LGBM_PARAMS, "n_estimators": best_iter}
+        model_nf     = LGBMRegressor(**final_params)
+        model_nf.fit(X_nf, y_nf)
+        dump(model_nf, MODEL_NONFIN)
+        log.info("비금융 모델 저장: %s (trees=%d)", MODEL_NONFIN, best_iter)
+
+        result["nonfin"] = {
+            "mae":        round(float(np.mean(cv_mae)),   6),
+            "smape":      round(float(np.mean(cv_smape)), 2),
+            "n_samples":  int(len(X_nf)),
+            "model_path": MODEL_NONFIN,
+            "best_iter":  best_iter,
+        }
+    else:
+        log.warning("비금융 샘플 없음 — 모델 학습 스킵")
+        result["nonfin"] = {}
+
+    # ── B. 금융 ──────────────────────────────
+    if not fin_window.empty:
+        log.info("=" * 55)
+        log.info("금융 모델 학습 (Ridge / 타깃=순이익)")
+        X_fin = create_features_fin_df(fin_window)
+        y_fin = fin_window["next_net_income"].values
+
+        cv_mae, cv_smape = _run_cv_fin(X_fin, y_fin)
+
+        # 최종 Ridge 모델
+        model_fin = Ridge(alpha=10.0)
+        model_fin.fit(X_fin, y_fin)
+        dump(model_fin, MODEL_FIN)
+        log.info("금융 모델 저장: %s (Ridge alpha=10)", MODEL_FIN)
+
+        result["fin"] = {
+            "mae":        round(float(np.mean(cv_mae)),   2),
+            "smape":      round(float(np.mean(cv_smape)), 2),
+            "n_samples":  int(len(X_fin)),
+            "model_path": MODEL_FIN,
+            "model_type": "Ridge",
+        }
+    else:
+        log.warning("금융 샘플 없음 — 모델 학습 스킵")
+        result["fin"] = {}
+
+    log.info("=" * 55)
+    log.info("전체 학습 완료: %s", result)
     return result
 
 
