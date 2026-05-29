@@ -5,10 +5,11 @@ predictor.py  ─ 모델 로드 및 예측 (비금융 / 금융 분리)
   - 비금융: next_op_margin (영업이익률) → 역산: pred_margin * revenue_4 = 영업이익
   - 금융  : next_net_income (순이익 절대값, KRW 원)
 
-[버그 수정]
-  - feature_engineering_fin 파일 없음 → feature_engineering 단일 파일로 통합
+[backend_to_ai_repo_review_20260529.md 반영]
+  - feature_engineering_fin.py(37피처/window=5) 제거 완료
+    → feature_engineering.py 단일 파일: 비금융(34피처) + 금융(9피처/window=2)
   - 모델 경로: model.pkl/model_financial.pkl → model_nonfin.pkl/model_fin.pkl
-  - 비금융 예측값이 영업이익률(무차원)임을 명시
+  - 비금융 반환값: 영업이익률(0~1), 금융 반환값: 순이익(KRW 절대값)
 
 사용:
   from predictor import predict, predict_from_raw, reload_model, ModelNotFoundError
