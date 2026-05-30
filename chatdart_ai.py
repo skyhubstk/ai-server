@@ -53,7 +53,7 @@ logging.basicConfig(
 )
 
 # ── A-세트(권위 정의) import ────────────────────────────────────
-# feature_engineering.py 단일 파일: 비금융(34피처) + 금융(9피처/window=2)
+# feature_engineering.py 단일 파일: 비금융(32피처) + 금융(9피처/window=2)
 from feature_engineering import create_features, create_features_fin
 from predictor           import predict_from_raw, reload_model, ModelNotFoundError
 from train               import run_training

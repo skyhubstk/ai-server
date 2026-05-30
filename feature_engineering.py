@@ -3,7 +3,7 @@ feature_engineering.py
 
 학습(train.py)과 추론(predictor.py) 양쪽에서 동일하게 사용.
 
-[비금융 피처] FEATURE_COLUMNS (34개)
+[비금융 피처] FEATURE_COLUMNS (32개)
   입력: revenue_0~4, op_0~4, net_0~4, tl_0~4, equity_0~4, cash_0~4, ta_0~4
   생성: op_margin, net_margin, 성장률, CAGR, 부채비율, ROE, ROA, 추세, 규모
 
