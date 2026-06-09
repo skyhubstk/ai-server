@@ -5,11 +5,9 @@ app.py  ─ ChatDart AI 동작 확인용 데모 스크립트
   1. python train.py     → 모델 학습 (model_nonfin.pkl / model_fin.pkl 생성)
   2. python app.py       → 예측 동작 확인
 
-[버그 수정]
-  - chatdart_ai 모듈 없음 → predictor.predict_from_raw() 직접 사용
-  - NON_FIN_RAW: "debt_*" → "tl_*" (total_liabilities, feature_engineering과 일치)
-  - FIN_RAW: window=2 기준 (ta_0~1, tl_0~1, equity_0~1, net_0~1)
-  - 비금융 예측값 = 영업이익률(float) → 역산하여 영업이익(원) 출력
+[예측 반환값]
+  비금융: predicted_op_margin (영업이익률, 비율) + 역산 영업이익(원)
+  금융  : predicted_roe (ROE 비율) + 역산 순이익(원) + base_equity
 """
 
 import logging
@@ -70,8 +68,11 @@ NON_FIN_RAW = {
 
 # ─────────────────────────────────────────────────────────────
 # 금융 샘플 데이터 (윈도우 2년: 2023~2024) ← window=2 기준
-# 키: ta_0~1, tl_0~1, equity_0~1, net_0~1
-#     (0=과거 1년, 1=최근 1년)
+# 키(필수): ta_0~1, tl_0~1, equity_0~1, net_0~1
+#           (0=과거 1년, 1=최근 1년)
+# 키(은행): nii_0~1 (순이자이익), llp_0~1 (대손충당금)
+# 키(보험): ins_liab_0~1 (보험계약부채)
+# 키(업종): sector_detail (bank | insurance | securities)
 # ─────────────────────────────────────────────────────────────
 FIN_RAW = {
     # 총자산 (원)
@@ -86,6 +87,16 @@ FIN_RAW = {
     # 당기순이익 (원)
     "net_0": 2_000_000_000_000,
     "net_1": 2_200_000_000_000,
+    # 은행 전용: 순이자이익, 대손충당금 (비은행은 0 또는 생략)
+    "nii_0": 3_500_000_000_000,
+    "nii_1": 3_700_000_000_000,
+    "llp_0":  300_000_000_000,
+    "llp_1":  280_000_000_000,
+    # 보험 전용: 보험계약부채 (비보험사는 0 또는 생략)
+    "ins_liab_0": 0,
+    "ins_liab_1": 0,
+    # 업종: bank / insurance / securities
+    "sector_detail": "bank",
 }
 
 
@@ -110,11 +121,15 @@ def main():
         print("  → python train.py 를 먼저 실행하세요.")
 
     # ── 금융 예측 ────────────────────────────────────────────
-    print("\n[금융]   다음 연도 당기순이익 예측...")
+    print("\n[금융]   다음 연도 ROE / 당기순이익 예측...")
     try:
         result = predict_from_raw(FIN_RAW, sector="financial")
-        ni     = result["predicted_net_income"]
-        print(f"  예측 당기순이익   : {ni:>20,.0f} 원")
+        roe    = result["predicted_roe"]          # ROE 비율 (예측 타깃)
+        ni     = result["predicted_net_income"]   # 역산 순이익 = roe × equity_1
+        equity = result["base_equity"]            # 기준 자본 (equity_1)
+        print(f"  기준 자본(equity_1) : {equity:>20,.0f} 원")
+        print(f"  예측 ROE            : {roe:>20.4f}  ({roe*100:.2f}%)")
+        print(f"  예측 순이익(역산)   : {ni:>20,.0f} 원")
     except ModelNotFoundError as e:
         print(f"  [오류] {e}")
         print("  → python train.py 를 먼저 실행하세요.")

@@ -7,10 +7,20 @@ feature_engineering.py
   입력: revenue_0~4, op_0~4, net_0~4, tl_0~4, equity_0~4, cash_0~4, ta_0~4
   생성: op_margin, net_margin, 성장률, CAGR, 부채비율, ROE, ROA, 추세, 규모
 
-[금융 피처] FEATURE_COLUMNS_FIN (9개) — window=2 기준
-  입력: ta_0~1, tl_0~1, equity_0~1, net_0~1
-  생성: leverage_ratio, equity_ratio, roe, roa, asset_growth, equity_growth,
-         net_growth, log_assets, net_margin_equity
+[금융 피처] FEATURE_COLUMNS_FIN (16개) — window=2 기준
+  입력(필수):    ta_0~1, tl_0~1, equity_0~1, net_0~1
+  입력(은행):    nii_0~1 (순이자이익), llp_0~1 (대손충당금)  — 없으면 0.0
+  입력(보험):    ins_liab_0~1 (보험계약부채)                 — 없으면 0.0
+  입력(업종):    sector_detail (bank/insurance/securities)   — 없으면 ""
+  생성:
+    건전성    leverage_ratio_1, equity_ratio_1
+    수익성    roe_1, roa_1
+    성장성    asset_growth, equity_growth, net_growth
+    규모      log_assets_1
+    ROE추세   roe_trend  (= roe_1 - roe_0)
+    은행      nii_ratio_1, llp_ratio_1, nii_growth
+    보험      ins_liab_ratio_1
+    업종원-핫 is_bank, is_insurance, is_securities
 
   금융사: revenue/operating_profit 없음 → 자산·자본·순이익 기반 피처만 사용
 """
@@ -45,15 +55,30 @@ FEATURE_COLUMNS = [
 # 금융 피처 컬럼 — window=2 (idx: 0=과거, 1=최근)
 # ──────────────────────────────────────────────
 FEATURE_COLUMNS_FIN = [
+    # ── 건전성 ──────────────────────────────
     "leverage_ratio_1",   # 부채/자산 (레버리지, 최근)
     "equity_ratio_1",     # 자본/자산 (자본건전성, 최근)
+    # ── 수익성 ──────────────────────────────
     "roe_1",              # 순이익/자본 (자본수익률, 최근)
     "roa_1",              # 순이익/자산 (자산수익률, 최근)
+    # ── 성장성 ──────────────────────────────
     "asset_growth",       # 총자산 성장률 (0→1년)
     "equity_growth",      # 자본 성장률 (0→1년)
     "net_growth",         # 순이익 성장률 (0→1년)
-    "log_assets_1",       # log(총자산) — 규모
-    "net_margin_equity",  # ROE 변화 (roe_1 - roe_0)
+    # ── 규모 ────────────────────────────────
+    "log_assets_1",       # log(총자산)
+    # ── ROE 변화 ────────────────────────────
+    "roe_trend",          # roe_1 - roe_0 (수익성 방향성)
+    # ── 은행 전용 ────────────────────────────
+    "nii_ratio_1",        # 순이자이익/총자산 (NIM 근사)
+    "llp_ratio_1",        # |대손충당금|/총자산 (건전성)
+    "nii_growth",         # 순이자이익 성장률 (0→1년)
+    # ── 보험 전용 ────────────────────────────
+    "ins_liab_ratio_1",   # 보험계약부채/총자산 (보험사 부채구조)
+    # ── 업종 원-핫 (LightGBM 트리 분기용) ───
+    "is_bank",            # 은행지주 여부 (1/0)
+    "is_insurance",       # 보험사 여부 (1/0)
+    "is_securities",      # 증권사 여부 (1/0)
 ]
 
 
@@ -154,21 +179,31 @@ def create_features_df(df: pd.DataFrame) -> pd.DataFrame:
 def create_features_fin(row: dict) -> dict:
     """
     금융사 원시 재무 데이터 dict → 파생 피처 dict.
-    row: {ta_0~1, tl_0~1, equity_0~1, net_0~1}
+
+    입력 키:
+      ta_0~1, tl_0~1, equity_0~1, net_0~1   (기본)
+      nii_0~1, llp_0~1                       (은행 전용, 없으면 0)
+      ins_liab_0~1                           (보험 전용, 없으면 0)
+      sector_detail                          (업종: bank/insurance/securities)
+
     window=2 (idx: 0=과거, 1=최근)
     """
-    ta  = [row.get(f"ta_{i}",     0.0) or 0.0 for i in range(2)]
-    tl  = [row.get(f"tl_{i}",     0.0) or 0.0 for i in range(2)]
-    eq  = [row.get(f"equity_{i}", 0.0) or 0.0 for i in range(2)]
-    net = [row.get(f"net_{i}",    0.0) or 0.0 for i in range(2)]
+    ta       = [row.get(f"ta_{i}",       0.0) or 0.0 for i in range(2)]
+    tl       = [row.get(f"tl_{i}",       0.0) or 0.0 for i in range(2)]
+    eq       = [row.get(f"equity_{i}",   0.0) or 0.0 for i in range(2)]
+    net      = [row.get(f"net_{i}",      0.0) or 0.0 for i in range(2)]
+    nii      = [row.get(f"nii_{i}",      0.0) or 0.0 for i in range(2)]
+    llp      = [row.get(f"llp_{i}",      0.0) or 0.0 for i in range(2)]
+    ins_liab = [row.get(f"ins_liab_{i}", 0.0) or 0.0 for i in range(2)]
+    sector   = str(row.get("sector_detail", "") or "")
 
     feats = {}
 
-    # 건전성 (최근 = index 1)
+    # 건전성
     feats["leverage_ratio_1"] = _safe_div(tl[1], ta[1])
     feats["equity_ratio_1"]   = _safe_div(eq[1], ta[1])
 
-    # 수익성 (최근)
+    # 수익성
     feats["roe_1"] = _safe_div(net[1], eq[1])
     feats["roa_1"] = _safe_div(net[1], ta[1])
 
@@ -180,9 +215,22 @@ def create_features_fin(row: dict) -> dict:
     # 규모
     feats["log_assets_1"] = _safe_log(ta[1])
 
-    # ROE 변화 (0→1)
+    # ROE 추세 (roe_1 - roe_0)
     roe_0 = _safe_div(net[0], eq[0])
-    feats["net_margin_equity"] = feats["roe_1"] - roe_0
+    feats["roe_trend"] = feats["roe_1"] - roe_0
+
+    # 은행 전용
+    feats["nii_ratio_1"] = _safe_div(nii[1], ta[1])
+    feats["llp_ratio_1"] = _safe_div(abs(llp[1]), ta[1])
+    feats["nii_growth"]  = _growth_rate(nii[1], nii[0])
+
+    # 보험 전용
+    feats["ins_liab_ratio_1"] = _safe_div(ins_liab[1], ta[1])
+
+    # 업종 원-핫 (LightGBM 트리가 업종별로 분기 가능하도록)
+    feats["is_bank"]       = 1.0 if sector == "bank"       else 0.0
+    feats["is_insurance"]  = 1.0 if sector == "insurance"  else 0.0
+    feats["is_securities"] = 1.0 if sector == "securities" else 0.0
 
     return {k: feats[k] for k in FEATURE_COLUMNS_FIN}
 

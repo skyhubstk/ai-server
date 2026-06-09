@@ -2,14 +2,23 @@
 predictor.py  ─ 모델 로드 및 예측 (비금융 / 금융 분리)
 
 [타깃 정의]
-  - 비금융: next_op_margin (영업이익률) → 역산: pred_margin * revenue_4 = 영업이익
-  - 금융  : next_net_income (순이익 절대값, KRW 원)
+  - 비금융: next_op_margin (영업이익률, 비율)
+    → 역산: predicted_op_margin × revenue_4 = 영업이익(원)
+  - 금융  : next_roe (ROE = 순이익/자본, 비율)
+    → 역산: predicted_roe × equity_1 = 순이익(원)
+    · 이전 next_net_income(절대값) 대비 scale 정규화로 LightGBM 학습 안정화
 
-[backend_to_ai_repo_review_20260529.md 반영]
-  - feature_engineering_fin.py(37피처/window=5) 제거 완료
-    → feature_engineering.py 단일 파일: 비금융(34피처) + 금융(9피처/window=2)
-  - 모델 경로: model.pkl/model_financial.pkl → model_nonfin.pkl/model_fin.pkl
-  - 비금융 반환값: 영업이익률(0~1), 금융 반환값: 순이익(KRW 절대값)
+[피처]
+  비금융: feature_engineering.py FEATURE_COLUMNS (32피처, window=5)
+  금융  : feature_engineering.py FEATURE_COLUMNS_FIN (16피처, window=2)
+    필수  ta_0~1, tl_0~1, equity_0~1, net_0~1
+    은행  nii_0~1, llp_0~1
+    보험  ins_liab_0~1
+    업종  sector_detail (bank/insurance/securities)
+
+[모델]
+  비금융: LightGBM → models/model_nonfin.pkl
+  금융  : LightGBM (소규모 트리) → models/model_fin.pkl
 
 사용:
   from predictor import predict, predict_from_raw, reload_model, ModelNotFoundError
@@ -78,13 +87,14 @@ def predict(features: dict, sector: str = "non_financial") -> float:
     ----------
     features : create_features() 또는 create_features_fin() 반환값
     sector   : "non_financial" (기본) → 영업이익률(0~1 비율) 반환
-               "financial"           → 순이익(KRW 원, 절대값) 반환
+               "financial"           → ROE(비율) 반환
+                                       역산은 predict_from_raw() 에서 처리
 
     Returns
     -------
     float
         비금융: 영업이익률 (예: 0.12 = 12%)
-        금융  : 순이익 (원)
+        금융  : ROE (예: 0.08 = 8%) — 역산: ROE × equity_1 = 순이익(원)
     """
     if sector == "financial":
         model   = _get_model_fin()
@@ -108,31 +118,39 @@ def predict_from_raw(raw: dict, sector: str = "non_financial") -> dict:
     Parameters
     ----------
     raw    : 비금융: {revenue_0~4, op_0~4, net_0~4, tl_0~4, equity_0~4, cash_0~4, ta_0~4}
-             금융  : {ta_0~1, tl_0~1, equity_0~1, net_0~1}  (window=2)
+             금융  : {ta_0~1, tl_0~1, equity_0~1, net_0~1,
+                      nii_0~1, llp_0~1, ins_liab_0~1, sector_detail}  (window=2)
     sector : "non_financial" | "financial"
 
     Returns
     -------
     dict
         비금융: {
-          "predicted_op_margin":  float,   # 예측 영업이익률 (0~1)
+          "predicted_op_margin":  float,   # 예측 영업이익률 (비율, 0~1)
           "predicted_op_profit":  float,   # 역산 영업이익 (원) = margin × revenue_4
           "base_revenue":         float,   # 기준 매출액 (revenue_4)
         }
         금융: {
-          "predicted_net_income": float,   # 예측 순이익 (원)
+          "predicted_roe":        float,   # 예측 ROE (비율, 순이익/자본)
+          "predicted_net_income": float,   # 역산 순이익 (원) = roe × equity_1
+          "base_equity":          float,   # 기준 자본 (equity_1)
         }
     """
     if sector == "financial":
-        feats         = create_features_fin(raw)
-        pred          = predict(feats, sector="financial")
+        feats       = create_features_fin(raw)
+        pred_roe    = predict(feats, sector="financial")
+        # 역산: predicted_net_income = predicted_roe × equity_1 (최근 자본)
+        base_equity = float(raw.get("equity_1", 0.0) or 0.0)
+        pred_ni     = pred_roe * base_equity
         return {
-            "predicted_net_income": pred,
+            "predicted_roe":        pred_roe,
+            "predicted_net_income": pred_ni,
+            "base_equity":          base_equity,
         }
     else:
-        feats         = create_features(raw)
-        pred_margin   = predict(feats, sector="non_financial")
-        base_revenue  = float(raw.get("revenue_4", 0.0) or 0.0)
+        feats          = create_features(raw)
+        pred_margin    = predict(feats, sector="non_financial")
+        base_revenue   = float(raw.get("revenue_4", 0.0) or 0.0)
         pred_op_profit = pred_margin * base_revenue
         return {
             "predicted_op_margin":  pred_margin,

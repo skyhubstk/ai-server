@@ -12,31 +12,30 @@ GPT 요약 생성은 백엔드에서 담당합니다.
 백엔드 사용 예시:
   from chatdart_ai import predict_next_profit, train_from_records
 
-  # 비금융 예측 (영업이익률 반환, ×revenue_4 → 영업이익)
+  # 비금융 예측 → 영업이익률(비율) 반환 (× revenue_4 → 영업이익)
   margin = predict_next_profit(data, sector="non_financial")
 
-  # 금융 예측 (당기순이익 KRW 절대값 반환)
+  # 금융 예측 → 역산 당기순이익(KRW 원) 반환
+  # 내부 동작: LightGBM → ROE 예측 → ROE × equity_1 = 순이익
   net_income = predict_next_profit(data, sector="financial")
 
-  # 비금융 학습
+  # 학습
   train_from_records(records, sector="non_financial")
-
-  # 금융 학습
   train_from_records(records, sector="financial")
 ────────────────────────────────────────────────────────
 
-[backend_to_ai_repo_review_20260529.md 반영]
-  - 발견 2-2 수정: feature_engineering_fin(37피처, window=5) → 제거
-    금융 피처 단일 권위: feature_engineering.py (9피처, window=2)
-  - 발견 2-3 수정: model_financial.pkl 경로 정리
-    금융 모델 단일: model_fin.pkl (train.py/predictor.py와 일치)
-  - 발견 2-4 수정: predictor.py docstring 불일치 해소
-  - 금융 입력 형식: window=5(assets_0~4) → window=2(ta_0~1) 변경
+피처 구성:
+  비금융: feature_engineering.py (32피처, window=5)
+  금융  : feature_engineering.py (16피처, window=2)
+    필수  ta_0~1, tl_0~1, equity_0~1, net_0~1
+    은행  nii_0~1, llp_0~1
+    보험  ins_liab_0~1
+    업종  sector_detail (bank/insurance/securities)
 
 단위 정책:
   DB / DART 원시 데이터는 모두 KRW(원) 단위.
   비금융 반환값: 영업이익률 (무차원 비율, 0~1)
-  금융  반환값: 당기순이익 (KRW 원)
+  금융  반환값: 역산 당기순이익 (KRW 원, = predicted_roe × equity_1)
 """
 
 import logging
@@ -53,7 +52,7 @@ logging.basicConfig(
 )
 
 # ── A-세트(권위 정의) import ────────────────────────────────────
-# feature_engineering.py 단일 파일: 비금융(32피처) + 금융(9피처/window=2)
+# feature_engineering.py 단일 파일: 비금융(32피처/window=5) + 금융(16피처/window=2)
 from feature_engineering import create_features, create_features_fin
 from predictor           import predict_from_raw, reload_model, ModelNotFoundError
 from train               import run_training
@@ -83,22 +82,27 @@ def predict_next_profit(data: dict, sector: str = "non_financial") -> float:
           ※ 단위 KRW(원)
 
         금융(sector="financial"):          ← window=2
-          ta_0~1       총자산 (_0=1년전, _1=최근)
-          tl_0~1       부채총계
-          equity_0~1   자본총계
-          net_0~1      당기순이익
+          ta_0~1         총자산 (_0=1년전, _1=최근)
+          tl_0~1         부채총계
+          equity_0~1     자본총계
+          net_0~1        당기순이익
+          nii_0~1        순이자이익 (은행; 없으면 0)
+          llp_0~1        대손충당금 (은행; 없으면 0)
+          ins_liab_0~1   보험계약부채 (보험사; 없으면 0)
+          sector_detail  업종 ("bank"/"insurance"/"securities"; 없으면 "")
           ※ 단위 KRW(원)
 
     sector : str
         "non_financial" (기본) → 영업이익률(0~1) 반환
                                   역산: 반환값 × data["revenue_4"] = 영업이익(원)
-        "financial"             → 당기순이익(KRW 절대값) 반환
+        "financial"             → 역산 당기순이익(KRW 원) 반환
+                                  내부: LightGBM → ROE 예측 → ROE × equity_1
 
     Returns
     -------
     float
         비금융: 영업이익률 (예: 0.11 = 11%)
-        금융  : 당기순이익 (원)
+        금융  : 역산 당기순이익 (원) = predicted_roe × equity_1
 
     Raises
     ------
@@ -133,8 +137,14 @@ def train_from_records(
         비금융: company, year, revenue, operating_profit,
                 net_income, total_liabilities (또는 debt), equity, cash
                 기업별 최소 6개 연도 이상
-        금융  : company, year, total_assets, total_liabilities,
-                equity, net_income, cash
+
+        금융  : company, year, is_financial=1,
+                total_assets, total_liabilities, equity, net_income,
+                net_interest_income (은행; 없으면 0),
+                loan_loss_provision  (은행; 없으면 0),
+                insurance_liability  (보험; 없으면 0),
+                sector_detail        ("bank"/"insurance"/"securities"),
+                report_type          ("A": 연간 데이터만 학습에 사용)
                 기업별 최소 3개 연도 이상 (window=2 + 타깃 1년)
 
     sector : str
@@ -175,9 +185,14 @@ def train_from_records(
         os.makedirs("data", exist_ok=True)
         if os.path.exists(csv_path):
             existing = pd.read_csv(csv_path)
+            # report_type 포함 dedup: 연간(A)·분기(Q3) 데이터가 같은 company+year라도
+            # 다른 행이므로 report_type까지 키에 포함 (없는 구버전 데이터는 그냥 통과)
+            dedup_cols = ["company", "year"]
+            if "report_type" in pd.concat([new_df, existing], ignore_index=True).columns:
+                dedup_cols.append("report_type")
             raw_df = (
                 pd.concat([new_df, existing], ignore_index=True)
-                .drop_duplicates(subset=["company", "year"])
+                .drop_duplicates(subset=dedup_cols)
                 .sort_values(["company", "year"])
                 .reset_index(drop=True)
             )

@@ -1,12 +1,13 @@
 """
 train.py
 
-[ChatGPT5.pdf 반영]
-  1. 비금융 타깃: next_operating_profit → next_op_margin (영업이익률)
-     · 삼성전자(50조)~소형주(100억) scale 차이 → 비율로 정규화 → MAPE 안정화
-  2. 금융 모델: LightGBM → Ridge Regression (샘플 부족 시 단순 모델이 안전)
-     · 샘플 < MIN_FIN_SAMPLES(50): 경고 출력 후 Ridge 사용
-  3. 평가지표: MAPE 단독 → MAE + SMAPE 병행
+[개선]
+  1. 비금융 타깃: next_op_margin (영업이익률, 비율) — 유지
+  2. 금융 모델:   Ridge → LightGBM (50샘플 + 16피처, 과적합 방지 파라미터)
+     · 타깃: next_net_income → next_roe (순이익/자본, 비율)
+     · scale 정규화로 LightGBM 학습 안정화
+     · CV: 2-fold → 3-fold (50샘플 확보 이후 적용)
+  3. 평가지표: MAE + SMAPE 병행
 
 비금융: models/model_nonfin.pkl
 금융  : models/model_fin.pkl
@@ -43,8 +44,8 @@ MODEL_DIR    = "models"
 MODEL_NONFIN = os.path.join(MODEL_DIR, "model_nonfin.pkl")
 MODEL_FIN    = os.path.join(MODEL_DIR, "model_fin.pkl")
 
-# 금융 샘플 최소 기준 (미만이면 Ridge 사용, 경고 로그)
-MIN_FIN_SAMPLES = 50
+# 금융 샘플 최소 기준 (미만이면 Ridge fallback)
+MIN_FIN_SAMPLES = 30
 
 # ── 비금융 하이퍼파라미터 (LightGBM) ──
 LGBM_PARAMS = dict(
@@ -62,9 +63,31 @@ LGBM_PARAMS = dict(
     n_jobs            = -1,
     verbose           = -1,
 )
-EARLY_STOPPING_ROUNDS = 30
-N_CV_NONFIN           = 5
-N_CV_FIN              = 2
+
+# ── 금융 하이퍼파라미터 (LightGBM — 소규모 데이터 과적합 방지) ──
+# · max_depth=3, num_leaves=7: 얕은 트리
+# · min_child_samples=8: 50샘플 기준 최소 16%
+# · 타깃 = next_roe (비율, -0.3~0.3): 비금융 LGBM_PARAMS 대비 learning_rate↑
+LGBM_PARAMS_FIN = dict(
+    n_estimators      = 500,
+    learning_rate     = 0.03,
+    max_depth         = 3,
+    num_leaves        = 7,
+    min_child_samples = 8,
+    subsample         = 0.8,
+    subsample_freq    = 1,
+    colsample_bytree  = 0.8,
+    reg_alpha         = 0.1,
+    reg_lambda        = 2.0,
+    random_state      = 42,
+    n_jobs            = -1,
+    verbose           = -1,
+)
+
+EARLY_STOPPING_ROUNDS     = 30
+EARLY_STOPPING_ROUNDS_FIN = 20   # 금융: 더 빠른 early stop (과적합 방지)
+N_CV_NONFIN               = 5
+N_CV_FIN                  = 3    # 50샘플 → 3-fold (이전 2-fold에서 확대)
 
 
 # ── 평가지표 ──────────────────────────────────
@@ -110,32 +133,53 @@ def _run_cv_nonfin(X: pd.DataFrame, y: np.ndarray) -> tuple:
     return cv_mae, cv_smape, best_iters
 
 
-# ── 금융 CV (Ridge) ──────────────────────────────────
+# ── 금융 CV (LightGBM, 타깃=ROE) ────────────────────────
 
 def _run_cv_fin(X: pd.DataFrame, y: np.ndarray) -> tuple:
+    """
+    금융 모델 CV.
+    - 샘플 >= MIN_FIN_SAMPLES: LightGBM (LGBM_PARAMS_FIN)
+    - 샘플 <  MIN_FIN_SAMPLES: Ridge fallback (안전망)
+    - 타깃: next_roe (비율) — MAE 단위 = ROE 포인트
+    """
     n = len(X)
-    if n < MIN_FIN_SAMPLES:
-        log.warning("[금융] 샘플 %d개 < %d → Ridge Regression 사용 (과적합 방지)",
-                    n, MIN_FIN_SAMPLES)
+    use_lgbm = (n >= MIN_FIN_SAMPLES)
+
+    if use_lgbm:
+        log.info("[금융] 샘플 %d개 → LightGBM (타깃=ROE)", n)
     else:
-        log.info("[금융] 샘플 %d개 → Ridge Regression", n)
+        log.warning("[금융] 샘플 %d개 < %d → Ridge fallback (과적합 방지)", n, MIN_FIN_SAMPLES)
 
     tscv = TimeSeriesSplit(n_splits=N_CV_FIN)
-    cv_mae, cv_smape = [], []
+    cv_mae, cv_smape, best_iters = [], [], []
 
-    log.info("[금융] TimeSeriesSplit %d-Fold CV (타깃: 순이익)", N_CV_FIN)
+    log.info("[금융] TimeSeriesSplit %d-Fold CV (타깃: ROE)", N_CV_FIN)
     for fold, (tr_i, val_i) in enumerate(tscv.split(X), 1):
-        m = Ridge(alpha=10.0)
-        m.fit(X.iloc[tr_i], y[tr_i])
+        if use_lgbm:
+            m = LGBMRegressor(**LGBM_PARAMS_FIN)
+            m.fit(
+                X.iloc[tr_i], y[tr_i],
+                eval_set=[(X.iloc[val_i], y[val_i])],
+                callbacks=[
+                    early_stopping(EARLY_STOPPING_ROUNDS_FIN, verbose=False),
+                    log_evaluation(period=-1),
+                ],
+            )
+            best_iters.append(
+                getattr(m, "best_iteration_", LGBM_PARAMS_FIN["n_estimators"]))
+        else:
+            m = Ridge(alpha=10.0)
+            m.fit(X.iloc[tr_i], y[tr_i])
+
         preds = m.predict(X.iloc[val_i])
         mae   = mean_absolute_error(y[val_i], preds)
         smp   = _smape(y[val_i], preds)
         cv_mae.append(mae); cv_smape.append(smp)
-        log.info("  Fold %d | MAE=%.4g | SMAPE=%.2f%%", fold, mae, smp)
+        log.info("  Fold %d | MAE=%.4f | SMAPE=%.2f%%", fold, mae, smp)
 
-    log.info("[금융] CV 평균 MAE=%.4g  SMAPE=%.2f%%",
+    log.info("[금융] CV 평균 MAE=%.4f  SMAPE=%.2f%%",
              np.mean(cv_mae), np.mean(cv_smape))
-    return cv_mae, cv_smape
+    return cv_mae, cv_smape, best_iters if use_lgbm else [], use_lgbm
 
 
 # ── 메인 ──────────────────────────────────────
@@ -191,24 +235,35 @@ def run_training(raw_df: pd.DataFrame = None) -> dict:
     # ── B. 금융 ──────────────────────────────
     if not fin_window.empty:
         log.info("=" * 55)
-        log.info("금융 모델 학습 (Ridge / 타깃=순이익)")
+        log.info("금융 모델 학습 (LightGBM / 타깃=ROE)")
         X_fin = create_features_fin_df(fin_window)
-        y_fin = fin_window["next_net_income"].values
+        y_fin = fin_window["next_roe"].values   # ← 타깃: ROE 비율
 
-        cv_mae, cv_smape = _run_cv_fin(X_fin, y_fin)
+        cv_mae, cv_smape, best_iters, use_lgbm = _run_cv_fin(X_fin, y_fin)
 
-        # 최종 Ridge 모델
-        model_fin = Ridge(alpha=10.0)
-        model_fin.fit(X_fin, y_fin)
+        if use_lgbm:
+            best_iter    = max(int(np.mean(best_iters)), 20) if best_iters else \
+                           LGBM_PARAMS_FIN["n_estimators"]
+            final_params = {**LGBM_PARAMS_FIN, "n_estimators": best_iter}
+            model_fin    = LGBMRegressor(**final_params)
+            model_fin.fit(X_fin, y_fin)
+            model_type = f"LightGBM (trees={best_iter})"
+        else:
+            model_fin  = Ridge(alpha=10.0)
+            model_fin.fit(X_fin, y_fin)
+            best_iter  = 0
+            model_type = "Ridge (fallback)"
+
         dump(model_fin, MODEL_FIN)
-        log.info("금융 모델 저장: %s (Ridge alpha=10)", MODEL_FIN)
+        log.info("금융 모델 저장: %s (%s)", MODEL_FIN, model_type)
 
         result["fin"] = {
-            "mae":        round(float(np.mean(cv_mae)),   2),
+            "mae":        round(float(np.mean(cv_mae)),   4),
             "smape":      round(float(np.mean(cv_smape)), 2),
             "n_samples":  int(len(X_fin)),
             "model_path": MODEL_FIN,
-            "model_type": "Ridge",
+            "model_type": model_type,
+            "target":     "next_roe",
         }
     else:
         log.warning("금융 샘플 없음 — 모델 학습 스킵")
